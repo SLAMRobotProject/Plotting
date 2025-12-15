@@ -3,11 +3,11 @@
 clear; 
 clc;
 
-dataFile = 'data\OptiTrack_data\may_25\nrf6_lqr_dynamic_integral_v2\nrf6_lqr_dynamic_integral_v2_1.mat';
+dataFile = '../Project_tests/ekf_175wb/data/test9.mat';
 
 load(dataFile);
 
-loadedVariables = who('-file', dataFile);
+loadedVariables = who('-file', dataFile);   
 loadedVariableName = loadedVariables{1}; 
 
 data = eval(loadedVariableName);
@@ -21,15 +21,37 @@ position_labels = data.Trajectories.Labeled.Labels;
 
 % Define a minimum distance for segments to be considered valid (e.g., 800 mm)
 min_distance = 700;
-label = "tower";
+label = 'tower';
 
 [segment_distances, segment_labels, corners, angles] = Movement_Analysis_Single_File(X, Y, min_distance, position_labels, label);
+
+
+% --- Plot raw path and detected corners ---
+figure; hold on; grid on; axis equal;
+xlabel('x position [mm]');
+ylabel('y position [mm]');
+title(sprintf('Raw OptiTrack path and detected corners for "%s"', label));
+
+% Extract the data for the chosen label
+pos_idx = find(strcmp(position_labels, label), 1);
+plot(X(:, pos_idx), Y(:, pos_idx), 'b-', 'LineWidth', 1.2);
+
+% Plot detected corners (RDP result)
+if ~isempty(corners)
+    scatter(corners(:,1), corners(:,2), 50, 'r', 'filled');
+    for ci = 1:size(corners,1)
+        text(corners(ci,1), corners(ci,2), sprintf('  %d', ci), ...
+            'Color', 'r', 'FontWeight', 'bold');
+    end
+end
+
+legend('Trajectory', 'Detected corners');
+
 
 % Print segment distances for the 'tower' label
 for i = 1:length(segment_distances)
     fprintf('Distance for segment %d "tower": %.2f mm\n', i, segment_distances(i));
 end
-
 % Print the calculated angles
 for i = 1:length(angles)
     fprintf('Angle at corner %d: %.2f degrees\n', i, angles(i));
@@ -45,27 +67,34 @@ fprintf('Average Segment Distance: %.2f mm (std: %.2f mm)\n', average_distance, 
 fprintf('Average of 90-degree turns: %.2f degrees (std: %.2f degrees)\n', average_angles_90, std_angles_90);
 fprintf('Average of 180-degree turn: %.2f degrees (std: %.2f degrees)\n', average_angles_180, std_angles_180);
 
+close all;
+
 %% Analyse all files in a folder
 
 clear;
 clc;
 
 % Folder containing all the .mat files
-folderPath = 'data\OptiTrack_data\may_25\nrf6_pid_lyap_turn_v1';
-
+folderPath = '../Project_tests/ekf_175wb/data/';
+    
 
 % Define a minimum distance for segments to be considered valid (e.g., 800 mm)
 min_distance = 700;
 label = 'tower';  
 % Specify the turn number that corresponds to the 180-degree turn (e.g., 4)
 turn_number_for_180 = 4;
-
-[final_average_distance, final_std_distance, final_average_90, final_std_90, final_average_180, final_std_180] = AnalyzeFolder(folderPath, min_distance, label, turn_number_for_180);
+[final_average_distance, final_std_distance, final_average_90, final_std_90, ...
+ final_average_180, final_std_180, per_turn_average_angles, per_turn_std_angles] = ...
+    AnalyzeFolder(folderPath, min_distance, label, turn_number_for_180);
 
 % Display the results
 fprintf('Final Average Segment Distance: %.2f mm (std: %.2f mm)\n', final_average_distance, final_std_distance);
 fprintf('Final Average of 90-degree turns: %.2f degrees (std: %.2f degrees)\n', final_average_90, final_std_90);
 fprintf('Final Average of 180-degree turn: %.2f degrees (std: %.2f degrees)\n', final_average_180, final_std_180);
+for turn_idx = 1:numel(per_turn_average_angles)
+    fprintf('Average angle for turn %d: %.2f degrees (std: %.2f degrees)\n', ...
+        turn_idx, per_turn_average_angles(turn_idx), per_turn_std_angles(turn_idx));
+end
 
 
 function [segment_distances, segment_labels, corners, angles] = Movement_Analysis_Single_File(X, Y, min_distance, position_labels, desired_label)
@@ -87,7 +116,7 @@ function [segment_distances, segment_labels, corners, angles] = Movement_Analysi
     if size(Y, 1) < size(Y, 2)
         Y = Y';
     end
-
+    [X,Y] = removeNaNValues(X,Y);
     num_points = size(X, 1);
     num_positions = size(X, 2);
     segment_distances = [];
@@ -103,80 +132,55 @@ function [segment_distances, segment_labels, corners, angles] = Movement_Analysi
 
         x_data = X(:, pos_idx);
         y_data = Y(:, pos_idx);
+        % --- RDP-based corner detection (simple & robust) ---
+        P = [x_data, y_data];
 
-        diffX = abs(diff(x_data));
-        diffY = abs(diff(y_data));
+        % Tolerance (mm). Smaller => more corners, larger => fewer
+        epsilon = 50;  % try 30–80 depending on noise / desired sensitivity
+        idx_keep = rdp_indices(P, epsilon);
 
-        varianceX = var(diffX(1:1000));
-        varianceY = var(diffY(1:1000));
-        threshold = 0.6 * sqrt(varianceX + varianceY);
+        % Corners are the kept points along the path
+        corner_points = P(idx_keep, :);
 
-        if mean(diffX(1:1000)) > mean(diffY(1:1000))
-            changing_coord = 'X';
-        else
-            changing_coord = 'Y';
-        end
+        % Segment distances (gate by min_distance) and filter corners accordingly
+        if size(corner_points,1) >= 2
+            % distances between consecutive RDP corners
+            seg_d = sqrt(sum(diff(corner_points,1,1).^2, 2));
+            use = seg_d >= min_distance;     % keep segments above threshold
 
-        start_idx = 1;
-        corner_points = [];
+            % record distances/labels for kept segments
+            if any(use)
+                segment_distances = [segment_distances, seg_d(use)'];
+                segment_labels = [segment_labels, repmat({label}, 1, nnz(use))];
+            end
 
-        for i = 2:num_points-1
-            if  (strcmp(changing_coord, 'X') && abs(diffX(i)) < threshold)
-                x_start = x_data(start_idx);
-                y_start = y_data(start_idx);
-                x_end = x_data(i);
-                y_end = y_data(i);
-                segment_distance = sqrt((x_end - x_start)^2 + (y_end - y_start)^2);
-
-                if segment_distance >= min_distance
-                    segment_distances = [segment_distances, segment_distance];
-                    segment_labels{end+1} = label;
-                    corner_points = [corner_points; x_start, y_start];
-                    start_idx = i + 1;
+            % Build a filtered corner list that only contains corners belonging
+            % to the kept segments (deduplicated, in order)
+            kept_idx = find(use);
+            corners_kept = [];
+            for k = 1:numel(kept_idx)
+                i = kept_idx(k);  % segment from corner i -> i+1
+                if isempty(corners_kept)
+                    corners_kept = [corners_kept; corner_points(i,:); corner_points(i+1,:)];
+                else
+                    % If current segment starts at the last kept corner, just append its end
+                    if all(corners_kept(end,:) == corner_points(i,:))
+                        corners_kept = [corners_kept; corner_points(i+1,:)];
+                    else
+                        % Gap in kept segments: start a new chain explicitly
+                        corners_kept = [corners_kept; corner_points(i,:); corner_points(i+1,:)];
+                    end
                 end
-                changing_coord = 'Y';
-
-            elseif (strcmp(changing_coord, 'Y') && abs(diffY(i)) < threshold)
-                x_start = x_data(start_idx);
-                y_start = y_data(start_idx);
-                x_end = x_data(i);
-                y_end = y_data(i);
-                segment_distance = sqrt((x_end - x_start)^2 + (y_end - y_start)^2);
-
-                if segment_distance >= min_distance
-                    segment_distances = [segment_distances, segment_distance];
-                    segment_labels{end+1} = label;
-                    corner_points = [corner_points; x_start, y_start];
-                    start_idx = i + 1;
-                end
-                changing_coord = 'X';
             end
+
+            % Replace with filtered corners for downstream usage (plot/angles)
+            corner_points = corners_kept;
         end
 
-        if start_idx < num_points
-            x_start = x_data(start_idx);
-            y_start = y_data(start_idx);
-            x_end = x_data(end);
-            y_end = y_data(end);
-            segment_distance = sqrt((x_end - x_start)^2 + (y_end - y_start)^2);
-
-            if segment_distance >= min_distance
-                segment_distances = [segment_distances, segment_distance];
-                segment_labels{end+1} = label;
-                corner_points = [corner_points; x_end, y_end];
-            end
+        % Append only filtered corners and compute angles only from them
+        if ~isempty(corner_points)
+            corners = [corners; corner_points];
         end
-
-        valid_idx = find(~isnan(x_data) & ~isnan(y_data), 1, 'last');
-        if ~isempty(valid_idx)
-            x_final = x_data(valid_idx);
-            y_final = y_data(valid_idx);
-            if isempty(corner_points) || norm(corner_points(end,:) - [x_final, y_final]) > 1e-3
-                corner_points = [corner_points; x_final, y_final];
-            end
-        end
-
-        corners = [corners; corner_points];
 
         if size(corner_points, 1) > 2
             angles = [angles, calculate_segment_angles(corner_points)];
@@ -238,7 +242,9 @@ function [average_distance, std_distance, average_angles_90, std_angles_90, aver
     std_angles_180 = std(angles_180, 1);
 end
 
-function [final_average_distance, final_std_distance, final_average_90, final_std_90, final_average_180, final_std_180] = AnalyzeFolder(folderPath, min_distance, label, turn_number_for_180)
+function [final_average_distance, final_std_distance, final_average_90, final_std_90, ...
+          final_average_180, final_std_180, per_turn_average_angles, per_turn_std_angles] = ...
+          AnalyzeFolder(folderPath, min_distance, label, turn_number_for_180)
     % AnalyzeFolder processes all .mat files in the folder, runs Movement_Analysis_Single_File on each file,
     % and calculates the average and standard deviation of segment distances, 90-degree turns, and 180-degree turns.
     % Inputs:
@@ -253,12 +259,15 @@ function [final_average_distance, final_std_distance, final_average_90, final_st
     %   final_std_90 - The overall standard deviation of 90-degree turns
     %   final_average_180 - The overall average angle for the 180-degree turn
     %   final_std_180 - The overall standard deviation of the 180-degree turn
+    %   per_turn_average_angles - Average angle for each turn index
+    %   per_turn_std_angles - Standard deviation per turn index
 
     files = dir(fullfile(folderPath, '*.mat'));
 
     all_distances = [];
     all_angles_90 = [];
     all_angles_180 = [];
+    angles_by_turn = {};
 
     for file_idx = 1:length(files)
         dataFile = fullfile(files(file_idx).folder, files(file_idx).name);
@@ -275,7 +284,6 @@ function [final_average_distance, final_std_distance, final_average_90, final_st
         position_labels = data.Trajectories.Labeled.Labels;
 
         [segment_distances, ~, ~, angles] = Movement_Analysis_Single_File(X, Y, min_distance, position_labels, label);
-
         valid_distances = segment_distances(segment_distances >= 800);
 
         angles_90 = [];
@@ -291,6 +299,12 @@ function [final_average_distance, final_std_distance, final_average_90, final_st
         all_distances = [all_distances, valid_distances];
         all_angles_90 = [all_angles_90, angles_90];
         all_angles_180 = [all_angles_180, angles_180];
+        for turn_idx = 1:length(angles)
+            if numel(angles_by_turn) < turn_idx
+                angles_by_turn{turn_idx} = []; %#ok<AGROW>
+            end
+            angles_by_turn{turn_idx}(end+1) = angles(turn_idx); %#ok<AGROW>
+        end
     end
 
     if isempty(all_distances)
@@ -319,4 +333,97 @@ function [final_average_distance, final_std_distance, final_average_90, final_st
         final_average_180 = mean(all_angles_180);
         final_std_180 = std(all_angles_180);
     end
+
+    num_turns = numel(angles_by_turn);
+    per_turn_average_angles = nan(1, num_turns);
+    per_turn_std_angles = nan(1, num_turns);
+    for turn_idx = 1:num_turns
+        turn_angles = angles_by_turn{turn_idx};
+        per_turn_average_angles(turn_idx) = mean(turn_angles);
+        per_turn_std_angles(turn_idx) = std(turn_angles);
+    end
 end
+
+
+function idx_keep = rdp_indices(P, eps)
+% Ramer–Douglas–Peucker: return indices of kept points (corners)
+% P   : robot trajectory [x y]
+% eps : tolerance, make higher if false corners appear
+
+    n = size(P,1);
+    if n <= 2
+        idx_keep = (1:n).';
+        return;
+    end
+
+    idx_keep = [1; n];
+    stack = [1, n];
+
+    while ~isempty(stack)
+        a = stack(end,1);
+        b = stack(end,2);
+        stack(end,:) = [];
+
+        A = P(a,:); B = P(b,:);
+        AB = B - A;
+        AB2 = sum(AB.^2);
+
+        maxd = 0; idx = -1;
+        for i = a+1:b-1
+            AP = P(i,:) - A;
+            if AB2 == 0
+                d = norm(AP);
+            else
+                t = max(0, min(1, dot(AP,AB)/AB2));
+                proj = A + t*AB;
+                d = norm(P(i,:) - proj);
+            end
+            if d > maxd
+                maxd = d; idx = i;
+            end
+        end
+
+        if maxd > eps
+            idx_keep = [idx_keep; idx]; 
+            stack = [stack; a, idx; idx, b]; 
+        end
+    end
+
+    % Remove corners with small angles (angles < 20 degrees)
+    min_angle_deg = 20;
+    idx_keep = sort(idx_keep);
+
+    while true
+        corner_pts = P(idx_keep, :);
+        ncp = size(corner_pts, 1);
+        if ncp < 3
+            break;
+        end
+
+        removed_any = false;
+        for k = 2:ncp-1
+            v1 = corner_pts(k, :) - corner_pts(k-1, :);
+            v2 = corner_pts(k+1, :) - corner_pts(k, :);
+            angle = atan2d(abs(det([v1; v2])), dot(v1, v2));
+            if angle < min_angle_deg
+                idx_keep(k) = []; 
+                removed_any = true;
+                break;            
+            end
+        end
+
+        if ~removed_any
+            break;
+        end
+    end
+
+    idx_keep = sort(idx_keep);
+end
+
+
+function [X_clean, Y_clean] = removeNaNValues(X, Y)
+    valid_rows = all(isfinite(X), 2) & all(isfinite(Y), 2);
+    X_clean = X(valid_rows, :);
+    Y_clean = Y(valid_rows, :);
+end
+
